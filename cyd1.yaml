@@ -8,6 +8,10 @@ globals:
     type: int
     restore_value: yes
     initial_value: "0" # 0=30%, 1=40%, 2=50%, 3=60%
+  - id: album_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0" # čas (millis) poslednej zmeny albumu
   - id: album_valid
     type: bool
     restore_value: no
@@ -63,7 +67,7 @@ api:
     key: !secret haapi_key
 
 logger:
-  level: DEBUG
+  level: INFO
 
 # --- ČASOVÝ SERVIS ---
 time:
@@ -95,30 +99,10 @@ sensor:
     moving_distance:
       id: moving_dist
       internal: true
-      filters:
-        - delta: 10.0
-        - throttle: 5s
-      on_value:
-        then:
-          - if:
-              condition:
-                lambda: 'return id(pritomnost).state && x > 0 && x <= 400;'
-              then:
-                - script.execute: backlight_timeout
 
     still_distance:
       id: still_dist
       internal: true
-      filters:
-        - delta: 10.0
-        - throttle: 5s
-      on_value:
-        then:
-          - if:
-              condition:
-                lambda: 'return id(pritomnost).state && x > 0 && x <= 400;'
-              then:
-                - script.execute: backlight_timeout
 
 # --- MEDIÁLNE SENZORY ---
 text_sensor:
@@ -129,15 +113,19 @@ text_sensor:
     internal: true
     on_value:
       then:
-        # Pri každej zmene skladby/streamu zneplatni album.
-        # Ak nový stream album pošle, media_album_name ho znova povolí.
-        - lambda: 'id(album_valid) = false;'
-        - lvgl.label.update:
-            id: album_lbl
-            text: ""
-        - lvgl.widget.update:
-            id: album_lbl
-            hidden: true
+        # Pri zmene skladby/streamu zneplatni album. Ak album prišiel práve
+        # pred názvom (v tej istej aktualizácii z HA), ponechaj ho.
+        - if:
+            condition:
+              lambda: 'return millis() - id(album_ms) > 1500;'
+            then:
+              - lambda: 'id(album_valid) = false;'
+              - lvgl.label.update:
+                  id: album_lbl
+                  text: ""
+              - lvgl.widget.update:
+                  id: album_lbl
+                  hidden: true
 
         - script.execute: update_track
 
@@ -159,17 +147,23 @@ text_sensor:
     internal: true
     on_value:
       then:
+        - lambda: 'id(album_ms) = millis();'
         - if:
             condition:
-              lambda: 'return !x.empty() && x != "unknown" && x != "unavailable" && id(media_state).state == "playing";'
+              lambda: 'return !x.empty() && x != "unknown" && x != "unavailable";'
             then:
+              # Platnosť sa nastaví vždy; zobrazí sa až keď hrá (inak ho ukáže media_state).
               - lambda: 'id(album_valid) = true;'
-              - lvgl.label.update:
-                  id: album_lbl
-                  text: !lambda 'return (std::string) x;'
-              - lvgl.widget.update:
-                  id: album_lbl
-                  hidden: false
+              - if:
+                  condition:
+                    lambda: 'return id(media_state).state == "playing";'
+                  then:
+                    - lvgl.label.update:
+                        id: album_lbl
+                        text: !lambda 'return (std::string) x;'
+                    - lvgl.widget.update:
+                        id: album_lbl
+                        hidden: false
             else:
               - lambda: 'id(album_valid) = false;'
               - lvgl.label.update:
@@ -532,6 +526,19 @@ lvgl:
                           }
 
 interval:
+  # Pokiaľ je v dosahu 5 m niekto prítomný (aj bez pohybu), displej zostane rozsvietený.
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(pritomnost).state) return false;
+              float m = id(moving_dist).state;
+              float s = id(still_dist).state;
+              return (m > 0 && m <= 500) || (s > 0 && s <= 500);
+          then:
+            - script.execute: backlight_timeout
+
   - interval: 1s
     then:
       - lvgl.label.update:
