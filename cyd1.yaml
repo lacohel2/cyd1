@@ -1,0 +1,538 @@
+# --- GLOBÁLNE PREMENNÉ ---
+globals:
+  - id: station_index
+    type: int
+    restore_value: no
+    initial_value: "0" # Čítač pre prepínanie staníc
+  - id: brightness_step
+    type: int
+    restore_value: yes
+    initial_value: "0" # 0=30%, 1=40%, 2=50%, 3=60%
+  - id: album_valid
+    type: bool
+    restore_value: no
+    initial_value: "false" # true iba keď aktuálny stream reálne poslal názov albumu
+
+# --- ZÁKLADNÁ IDENTITA ZARIADENIA ---
+esphome:
+  name: cyd1
+  friendly_name: CYD1
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: backlight_timeout 
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+  variant: esp32
+
+# --- SIEŤOVÉ NASTAVENIA ---
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.2.12
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+api:
+  encryption:
+    key: !secret haapi_key
+
+logger:
+  level: DEBUG
+
+# --- ČASOVÝ SERVIS ---
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "CET-1CEST,M3.5.0,M10.5.0/3"
+
+# --- SENZORIKA LD2410 ---
+uart:
+  id: uart_ld2410
+  tx_pin: 22
+  rx_pin: 21
+  baud_rate: 256000
+
+ld2410:
+  id: ld2410_sensor
+  uart_id: uart_ld2410
+
+binary_sensor:
+  - platform: ld2410
+    ld2410_id: ld2410_sensor
+    has_target:
+      id: pritomnost
+      internal: true
+
+sensor:
+  - platform: ld2410
+    ld2410_id: ld2410_sensor
+    moving_distance:
+      id: moving_dist
+      internal: true
+      filters:
+        - delta: 10.0
+        - throttle: 5s
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return id(pritomnost).state && x > 0 && x <= 400;'
+              then:
+                - script.execute: backlight_timeout
+
+    still_distance:
+      id: still_dist
+      internal: true
+      filters:
+        - delta: 10.0
+        - throttle: 5s
+      on_value:
+        then:
+          - if:
+              condition:
+                lambda: 'return id(pritomnost).state && x > 0 && x <= 400;'
+              then:
+                - script.execute: backlight_timeout
+
+# --- MEDIÁLNE SENZORY ---
+text_sensor:
+  - platform: homeassistant
+    id: media_title
+    entity_id: media_player.volumio4
+    attribute: media_title
+    internal: true
+    on_value:
+      then:
+        # Pri každej zmene skladby/streamu zneplatni album.
+        # Ak nový stream album pošle, media_album_name ho znova povolí.
+        - lambda: 'id(album_valid) = false;'
+        - lvgl.label.update:
+            id: album_lbl
+            text: ""
+        - lvgl.widget.update:
+            id: album_lbl
+            hidden: true
+
+        - if:
+            condition:
+              lambda: 'return id(media_state).state == "playing";'
+            then:
+              - lvgl.label.update:
+                  id: track_lbl
+                  text_font: font_track
+                  text: !lambda 'return (std::string) x;'
+            
+  - platform: homeassistant
+    id: media_artist
+    entity_id: media_player.volumio4
+    attribute: media_artist
+    internal: true
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: artist_lbl
+            text: !lambda 'return (std::string) x;'
+
+  - platform: homeassistant
+    id: media_album_name
+    entity_id: media_player.volumio4
+    attribute: media_album_name
+    internal: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return !x.empty() && x != "unknown" && x != "unavailable" && id(media_state).state == "playing";'
+            then:
+              - lambda: 'id(album_valid) = true;'
+              - lvgl.label.update:
+                  id: album_lbl
+                  text: !lambda 'return (std::string) x;'
+              - lvgl.widget.update:
+                  id: album_lbl
+                  hidden: false
+            else:
+              - lambda: 'id(album_valid) = false;'
+              - lvgl.label.update:
+                  id: album_lbl
+                  text: ""
+              - lvgl.widget.update:
+                  id: album_lbl
+                  hidden: true
+
+  - platform: homeassistant
+    id: media_state
+    entity_id: media_player.volumio4
+    internal: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "playing";'
+            then:
+              - lvgl.label.update:
+                  id: track_lbl
+                  text_font: font_track
+                  text: !lambda |-
+                    if (id(media_title).state.empty()) {
+                      return std::string("");
+                    }
+                    return id(media_title).state;
+              - lvgl.widget.update:
+                  id: track_lbl
+                  hidden: false
+              - lvgl.widget.update:
+                  id: artist_lbl
+                  hidden: false
+              - if:
+                  condition:
+                    lambda: 'return id(album_valid);'
+                  then:
+                    - lvgl.label.update:
+                        id: album_lbl
+                        text: !lambda 'return id(media_album_name).state;'
+                    - lvgl.widget.update:
+                        id: album_lbl
+                        hidden: false
+                  else:
+                    - lvgl.label.update:
+                        id: album_lbl
+                        text: ""
+                    - lvgl.widget.update:
+                        id: album_lbl
+                        hidden: true
+            else:
+              - lambda: 'id(album_valid) = false;'
+              - lvgl.label.update:
+                  id: track_lbl
+                  text_font: font_idle_date
+                  text: !lambda |-
+                    auto now = id(sntp_time).now();
+                    if (!now.is_valid()) return std::string("");
+                    const char *dni[] = {
+                      "",
+                      "Nedeľa",
+                      "Pondelok",
+                      "Utorok",
+                      "Streda",
+                      "Štvrtok",
+                      "Piatok",
+                      "Sobota"
+                    };
+                    char buf[50];
+                    snprintf(buf, sizeof(buf), "%02d.%02d.%04d  %s",
+                      now.day_of_month,
+                      now.month,
+                      now.year,
+                      dni[now.day_of_week]
+                    );
+                    return std::string(buf);
+              - lvgl.widget.update:
+                  id: track_lbl
+                  hidden: false
+              - lvgl.widget.update:
+                  id: artist_lbl
+                  hidden: true
+              - lvgl.label.update:
+                  id: album_lbl
+                  text: ""
+              - lvgl.widget.update:
+                  id: album_lbl
+                  hidden: true
+
+# --- HARDVÉR DISPLEJA ---
+spi:
+  clk_pin: 14
+  mosi_pin: 13
+  miso_pin: 12
+
+output:
+  - platform: ledc
+    pin: 27
+    id: backlight_pin
+
+light:
+  - platform: monochromatic
+    output: backlight_pin
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 1s
+
+i2c:
+  sda: 33
+  scl: 32
+  scan: true
+
+touchscreen:
+  - platform: cst816
+    id: cyd_touch
+    display: my_display
+    transform:
+      mirror_x: true
+      mirror_y: false
+      swap_xy: true
+    on_touch:
+      then:
+        - script.execute: backlight_timeout
+
+# --- SKRIPTY ---
+script:
+  - id: backlight_timeout
+    mode: restart
+    then:
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda |-
+            if (id(brightness_step) == 1) return 0.4;
+            if (id(brightness_step) == 2) return 0.5;
+            if (id(brightness_step) == 3) return 0.6;
+            return 0.3;
+      - delay: 15s
+      - light.turn_on:
+          id: display_backlight
+          brightness: 5%
+      - delay: 20s
+      - light.turn_off:
+          id: display_backlight
+
+  - id: show_brightness
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: brightness_lbl
+          text: !lambda |-
+            int percent = 30 + (id(brightness_step) * 10);
+            return std::to_string(percent) + "%";
+      - lvgl.widget.update:
+          id: brightness_lbl
+          hidden: false
+      - delay: 1200ms
+      - lvgl.widget.update:
+          id: brightness_lbl
+          hidden: true
+
+# --- KONFIGURÁCIA FONTOV ---
+font:
+  - file: "gfonts://Roboto"
+    id: font_time
+    size: 120
+    glyphs: "0123456789:"
+    
+  - file: "gfonts://Roboto"
+    id: font_track
+    size: 42
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,+-° :áäčďéěíĺľňóôŕřšťúýžÁÄČĎÉĚÍĹĽŇÓÔŘŔŠŤÚÝŽàâæçèêëîïœùûüÿÀÂÆÇÈÊËÎÏŒÙÛŸßöÖ'\"/()[]&!?*@#%‘’`"
+
+  - file: "gfonts://Roboto"
+    id: font_idle_date
+    size: 30
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,+-° :áäčďéěíĺľňóôŕřšťúýžÁÄČĎÉĚÍĹĽŇÓÔŘŔŠŤÚÝŽàâæçèêëîïœùûüÿÀÂÆÇÈÊËÎÏŒÙÛŸßöÖ'\"/()[]&!?*@#%‘’`"
+
+  - file: "gfonts://Roboto"
+    id: font_artist
+    size: 22
+    glyphs: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,+-° :áäčďéěíĺľňóôŕřšťúýžÁÄČĎÉĚÍĹĽŇÓÔŘŔŠŤÚÝŽàâæçèêëîïœùûüÿÀÂÆÇÈÊËÎÏŒÙÛŸßöÖ'\"/()[]&!?*@#%‘’`"
+
+# --- KONFIGURÁCIA GRAFIKY ---
+display:
+  - platform: mipi_spi
+    id: my_display
+    model: ILI9341
+    cs_pin: 15
+    dc_pin: 2
+    reset_pin: 4
+    rotation: 0
+    data_rate: 20MHz
+    invert_colors: false
+    color_order: rgb
+    dimensions: 320x240
+
+lvgl:
+  buffer_size: 25%
+  bg_color: 0x000000
+  displays:
+    - my_display
+  widgets:
+    - button:
+        align: TOP_MID
+        y: 0
+        width: 100
+        height: 40
+        bg_opa: 0%
+        border_width: 0
+        shadow_width: 0
+        on_click:
+          then:
+            - lambda: |-
+                id(brightness_step)++;
+                if (id(brightness_step) > 3) id(brightness_step) = 0;
+            - script.execute: backlight_timeout
+            - script.execute: show_brightness
+
+    - label:
+        id: time_lbl
+        align: TOP_MID
+        y: 0
+        text_font: font_time
+        text_color: 0xFFFFFF
+
+    - label:
+        id: brightness_lbl
+        text: ""
+        hidden: true
+        align: BOTTOM_MID
+        y: -4
+        text_font: font_artist
+        text_color: 0xFFFF00
+
+    - label:
+        id: track_lbl
+        text: ""
+        hidden: false
+        align: TOP_MID
+        x: 0
+        y: 125
+        width: 320
+        text_font: font_idle_date
+        text_color: 0xFFFF00
+        long_mode: SCROLL
+        scroll_elastic: true
+        text_align: CENTER
+
+    # Neviditeľné play/pause tlačidlo vľavo dole.
+    - button:
+        align: BOTTOM_LEFT
+        x: 0
+        y: 0
+        width: 80
+        height: 80
+        bg_opa: 0%
+        border_width: 0
+        shadow_width: 0
+        on_click:
+          - homeassistant.action:
+              action: media_player.media_play_pause
+              data:
+                entity_id: media_player.volumio4
+
+    - label:
+        id: artist_lbl
+        text: ""
+        hidden: true
+        align: BOTTOM_MID
+        x: 0
+        y: -30
+        width: 320
+        text_font: font_artist
+        text_color: 0xAAAAAA
+        long_mode: SCROLL
+        text_align: CENTER
+
+    - label:
+        id: album_lbl
+        text: ""
+        hidden: true
+        align: BOTTOM_MID
+        x: 0
+        y: -4
+        width: 320
+        text_font: font_artist
+        text_color: 0x777777
+        long_mode: SCROLL
+        text_align: CENTER
+
+    # Neviditeľné tlačidlo rádií vpravo dole.
+    - button:
+        id: radio_btn
+        align: BOTTOM_RIGHT
+        x: 0
+        y: 0
+        width: 80
+        height: 80
+        bg_opa: 0%
+        border_width: 0
+        shadow_width: 0
+        on_click:
+          then:
+            - lambda: 'id(album_valid) = false;'
+            - lvgl.label.update:
+                id: album_lbl
+                text: ""
+            - lvgl.widget.update:
+                id: album_lbl
+                hidden: true
+            - lambda: |-
+                id(station_index)++;
+                if (id(station_index) > 4) id(station_index) = 1;
+            - homeassistant.action:
+                action: media_player.play_media
+                data:
+                  entity_id: media_player.volumio4
+                  media_content_type: "music"
+                data_template:
+                  media_content_id: !lambda |-
+                    if (id(station_index) == 1) {
+                      return "{\"service\":\"webradio\",\"type\":\"webradio\",\"title\":\"Radio Blues\",\"uri\":\"https://i4.streams.ovh/sc/bluesrad/stream\"}";
+                    } else if (id(station_index) == 2) {
+                      return "{\"service\":\"webradio\",\"type\":\"webradio\",\"title\":\"Fun CS\",\"uri\":\"http://stream.funradio.sk:8000/cs128.mp3\"}";
+                    } else if (id(station_index) == 3) {
+                      return "{\"service\":\"webradio\",\"type\":\"webradio\",\"title\":\"Fun 80-90s\",\"uri\":\"http://stream.funradio.sk:8000/80-90-128.mp3\"}";
+                    } else {
+                      return "{\"service\":\"webradio\",\"type\":\"webradio\",\"title\":\"Radio Paradise FLAC\",\"uri\":\"http://stream.radioparadise.com/flacm\"}";
+                    }
+
+interval:
+  - interval: 1s
+    then:
+      - lvgl.label.update:
+          id: time_lbl
+          text: !lambda 'return id(sntp_time).now().strftime("%H:%M");'
+      - if:
+          condition:
+            lambda: 'return id(media_state).state != "playing";'
+          then:
+            - lvgl.label.update:
+                id: track_lbl
+                text_font: font_idle_date
+                text: !lambda |-
+                  auto now = id(sntp_time).now();
+                  if (!now.is_valid()) return std::string("");
+                  const char *dni[] = {
+                    "",
+                    "Nedeľa",
+                    "Pondelok",
+                    "Utorok",
+                    "Streda",
+                    "Štvrtok",
+                    "Piatok",
+                    "Sobota"
+                  };
+                  char buf[50];
+                  snprintf(buf, sizeof(buf), "%02d.%02d.%04d  %s",
+                    now.day_of_month,
+                    now.month,
+                    now.year,
+                    dni[now.day_of_week]
+                  );
+                  return std::string(buf);
+            - lvgl.widget.update:
+                id: track_lbl
+                hidden: false
+          else:
+            - lvgl.label.update:
+                id: track_lbl
+                text_font: font_track
+                text: !lambda |-
+                  if (id(media_title).state.empty()) {
+                    return std::string("");
+                  }
+                  return id(media_title).state;
+            - lvgl.widget.update:
+                id: track_lbl
+                hidden: false
